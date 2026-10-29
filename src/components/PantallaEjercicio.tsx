@@ -4,7 +4,11 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { nombreNota, type Ejercicio } from '../data/ejercicios';
-import { ensureAudioContext, tocarNota } from '../audio/tono';
+import {
+  ensureAudioContext,
+  tocarReferencia,
+  type TimbreReferencia,
+} from '../audio/tono';
 import { useMicrofono } from '../audio/useMicrofono';
 import { clasificarCents, type Afinacion } from '../audio/pitchDetector';
 import {
@@ -18,6 +22,7 @@ import { colorEnVivo, consejoDe } from './feedback';
 import { dibujarPianoRoll } from './pianoRoll';
 import AjusteAlturaVocal from './AjusteAlturaVocal';
 import AyudaLeccion from './AyudaLeccion';
+import MisReferencias from './MisReferencias';
 import { leccionParaEjercicio } from '../data/leccionesMusica';
 import {
   cargarModoPrincipiante,
@@ -31,6 +36,12 @@ import {
   type TransposicionVocal,
 } from '../storage/progreso';
 import { transponerNotas } from '../musica/transposicion';
+import {
+  cargarTimbreReferencia,
+  eliminarReferencia,
+  guardarReferencia,
+  guardarTimbreReferencia,
+} from '../storage/referenciasVoz';
 
 type Fase = 'intro' | 'activa' | 'resultados';
 type SubFase = 'escucha' | 'canta';
@@ -44,6 +55,14 @@ interface EnVivo {
   consejo: string;
   precisionParcial: number | null;
   tiempoVozMs: number;
+}
+
+interface TomaActual {
+  blob: Blob;
+  url: string;
+  id?: string;
+  guardada: boolean;
+  duracionMs: number;
 }
 
 const MAX_TRAMAS = 3600; // 60 s a 60 fps en modo a tu ritmo
@@ -97,9 +116,26 @@ export default function PantallaEjercicio({
   const [resultados, setResultados] = useState<NotaResultado[]>([]);
   const [enVivo, setEnVivo] = useState<EnVivo>(VIVO_INICIAL);
   const [ocupado, setOcupado] = useState(false);
+  const [timbre, setTimbre] = useState<TimbreReferencia>(
+    cargarTimbreReferencia,
+  );
+  const [refrescarReferencias, setRefrescarReferencias] = useState(0);
+  const [tomasGuardadas, setTomasGuardadas] = useState(0);
+  const [avisoToma, setAvisoToma] = useState('');
+  const [tomaActual, setTomaActual] = useState<TomaActual | null>(null);
+  const [grabandoManual, setGrabandoManual] = useState(false);
+  const [guardandoToma, setGuardandoToma] = useState(false);
 
-  const { estado, mensajeError, motorRef, fijarObjetivo, iniciar, detener } =
-    useMicrofono();
+  const {
+    estado,
+    mensajeError,
+    motorRef,
+    flujoRef,
+    fijarObjetivo,
+    iniciar,
+    detener,
+  } = useMicrofono();
+  const puedeGrabar = typeof MediaRecorder !== 'undefined';
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const historialRef = useRef<(number | null)[]>([]);
   const octavaRef = useRef<ConteoOctava>({ arriba: 0, abajo: 0, voz: 0 });
@@ -112,6 +148,11 @@ export default function PantallaEjercicio({
   const tiempoVozRef = useRef(0);
   const ultimoFrameMsRef = useRef(0);
   const medirRef = useRef(false);
+  const timbreRef = useRef(timbre);
+  const grabadoraManualRef = useRef<MediaRecorder | null>(null);
+  const fragmentosManualRef = useRef<Blob[]>([]);
+  const inicioManualRef = useRef(0);
+  const tomaActualRef = useRef<TomaActual | null>(null);
 
   const notasPractica = transponerNotas(ejercicio.notas, transposicion);
   const notaActual = notasPractica[idx];
@@ -121,12 +162,35 @@ export default function PantallaEjercicio({
   }, [tolerancia]);
 
   useEffect(() => {
+    timbreRef.current = timbre;
+  }, [timbre]);
+
+  useEffect(() => {
+    tomaActualRef.current = tomaActual;
+  }, [tomaActual]);
+
+  useEffect(() => {
     canceladoRef.current = false;
     return () => {
       canceladoRef.current = true;
       avanzarRef.current?.();
       avanzarRef.current = null;
       cancelAnimationFrame(rafRef.current);
+      const grabadora = grabadoraManualRef.current;
+      grabadoraManualRef.current = null;
+      if (grabadora && grabadora.state !== 'inactive') {
+        grabadora.ondataavailable = null;
+        grabadora.onstop = null;
+        try {
+          grabadora.stop();
+        } catch {
+          // Ya estaba detenida.
+        }
+      }
+      if (tomaActualRef.current?.url && !tomaActualRef.current.guardada) {
+        URL.revokeObjectURL(tomaActualRef.current.url);
+      }
+      fragmentosManualRef.current = [];
     };
   }, []);
 
@@ -140,6 +204,137 @@ export default function PantallaEjercicio({
     guardarTransposicionVocal(v);
   };
 
+  const cambiarTimbre = (v: TimbreReferencia) => {
+    setTimbre(v);
+    guardarTimbreReferencia(v);
+  };
+
+  const iniciarGrabacionManual = () => {
+    if (!puedeGrabar) {
+      setAvisoToma('Este navegador no permite grabar audio.');
+      return;
+    }
+    const flujo = flujoRef.current;
+    if (!flujo) {
+      setAvisoToma('El micrófono no está activo todavía.');
+      return;
+    }
+    if (tomaActualRef.current?.url && !tomaActualRef.current.guardada) {
+      URL.revokeObjectURL(tomaActualRef.current.url);
+    }
+    setTomaActual(null);
+
+    try {
+      const tipos = [
+        'audio/webm;codecs=opus',
+        'audio/webm',
+        'audio/ogg;codecs=opus',
+        'audio/mp4',
+      ];
+      const tipo = tipos.find((valor) => MediaRecorder.isTypeSupported(valor));
+      const grabadora = tipo
+        ? new MediaRecorder(flujo, { mimeType: tipo })
+        : new MediaRecorder(flujo);
+
+      fragmentosManualRef.current = [];
+      inicioManualRef.current = performance.now();
+
+      grabadora.ondataavailable = (evento) => {
+        if (evento.data.size > 0) fragmentosManualRef.current.push(evento.data);
+      };
+
+      grabadora.onstop = () => {
+        const duracion = Math.max(
+          100,
+          Math.round(performance.now() - inicioManualRef.current),
+        );
+        const blob = new Blob(fragmentosManualRef.current, {
+          type: grabadora.mimeType || 'audio/webm',
+        });
+        fragmentosManualRef.current = [];
+        grabadoraManualRef.current = null;
+        setGrabandoManual(false);
+
+        if (blob.size > 0) {
+          const url = URL.createObjectURL(blob);
+          setTomaActual({
+            blob,
+            url,
+            guardada: false,
+            duracionMs: duracion,
+          });
+        }
+      };
+
+      grabadora.start(100);
+      grabadoraManualRef.current = grabadora;
+      setGrabandoManual(true);
+      setAvisoToma('');
+    } catch {
+      setGrabandoManual(false);
+      setAvisoToma('No se pudo iniciar la grabación en este navegador.');
+    }
+  };
+
+  const detenerGrabacionManual = () => {
+    const grabadora = grabadoraManualRef.current;
+    if (grabadora && grabadora.state !== 'inactive') {
+      try {
+        grabadora.stop();
+      } catch {
+        // Ignorar si ya estaba detenida.
+      }
+    }
+    setGrabandoManual(false);
+  };
+
+  const guardarTomaActual = async () => {
+    if (!tomaActual || tomaActual.guardada || guardandoToma || !notaActual) return;
+    setGuardandoToma(true);
+    try {
+      const parcial =
+        enVivo.precisionParcial ?? (resultados[idx]?.precision ?? 70);
+      const cents = enVivo.cents ?? 0;
+      const ref = await guardarReferencia({
+        midi: notaActual.midi,
+        ejercicioId: ejercicio.id,
+        precision: Math.max(0, Math.min(100, Math.round(parcial))),
+        centsMedio: cents,
+        duracionMs: tomaActual.duracionMs,
+        blob: tomaActual.blob,
+      });
+      setTomaActual((actual) =>
+        actual ? { ...actual, guardada: true, id: ref.id } : null,
+      );
+      setTomasGuardadas((n) => n + 1);
+      setRefrescarReferencias((v) => v + 1);
+      setAvisoToma('');
+    } catch (err) {
+      setAvisoToma(
+        err instanceof Error ? err.message : 'No se pudo guardar la toma.',
+      );
+    } finally {
+      setGuardandoToma(false);
+    }
+  };
+
+  const descartarTomaActual = async () => {
+    if (!tomaActual) return;
+    if (tomaActual.id) {
+      try {
+        await eliminarReferencia(tomaActual.id);
+        setTomasGuardadas((n) => Math.max(0, n - 1));
+        setRefrescarReferencias((v) => v + 1);
+      } catch {
+        // Ignorar si falla el borrado
+      }
+    }
+    if (tomaActual.url) {
+      URL.revokeObjectURL(tomaActual.url);
+    }
+    setTomaActual(null);
+  };
+
   const empezar = async () => {
     if (ocupado) return;
     setOcupado(true);
@@ -151,6 +346,12 @@ export default function PantallaEjercicio({
       return;
     }
     setResultados([]);
+    setTomasGuardadas(0);
+    setAvisoToma('');
+    if (tomaActualRef.current?.url && !tomaActualRef.current.guardada) {
+      URL.revokeObjectURL(tomaActualRef.current.url);
+    }
+    setTomaActual(null);
     setIdx(0);
     idxRef.current = 0;
     setEnVivo(VIVO_INICIAL);
@@ -231,6 +432,11 @@ export default function PantallaEjercicio({
     for (let i = 0; i < notasPractica.length; i++) {
       if (canceladoRef.current) break;
       const n = notasPractica[i];
+      detenerGrabacionManual();
+      if (tomaActualRef.current?.url && !tomaActualRef.current.guardada) {
+        URL.revokeObjectURL(tomaActualRef.current.url);
+      }
+      setTomaActual(null);
       setIdx(i);
       idxRef.current = i;
       historialRef.current = [];
@@ -241,7 +447,11 @@ export default function PantallaEjercicio({
       if (n.referencia !== undefined) {
         setSubFase('escucha');
         try {
-          await tocarNota(n.referencia, n.segundosRef ?? 1.2);
+          await tocarReferencia(
+            n.referencia,
+            n.segundosRef ?? 1.2,
+            timbreRef.current,
+          );
         } catch {
           // audio no disponible: seguir igual
         }
@@ -265,17 +475,17 @@ export default function PantallaEjercicio({
         await pausaCancellable(n.segundos * 1000, canceladoRef);
         if (canceladoRef.current) break;
       }
-      res.push(
-        puntuar(
-          historialRef.current,
-          toleranciaRef.current,
-          octavaRef.current,
-          n.midi,
-        ),
+      const resultado = puntuar(
+        historialRef.current,
+        toleranciaRef.current,
+        octavaRef.current,
+        n.midi,
       );
+      res.push(resultado);
       setResultados([...res]);
     }
 
+    detenerGrabacionManual();
     window.clearInterval(idTexto);
     cancelAnimationFrame(rafRef.current);
     fijarObjetivo(null);
@@ -308,6 +518,11 @@ export default function PantallaEjercicio({
     avanzarRef.current?.();
     avanzarRef.current = null;
     cancelAnimationFrame(rafRef.current);
+    detenerGrabacionManual();
+    if (tomaActualRef.current?.url && !tomaActualRef.current.guardada) {
+      URL.revokeObjectURL(tomaActualRef.current.url);
+    }
+    setTomaActual(null);
     detener();
     alVolver();
   };
@@ -319,6 +534,7 @@ export default function PantallaEjercicio({
 
   const reproducirReferencia = async (reiniciar: boolean) => {
     if (!notaActual) return;
+    detenerGrabacionManual();
     medirRef.current = false;
     if (reiniciar) {
       historialRef.current = [];
@@ -326,9 +542,10 @@ export default function PantallaEjercicio({
       tiempoVozRef.current = 0;
       setEnVivo((actual) => ({ ...actual, tiempoVozMs: 0 }));
     }
-    await tocarNota(
+    await tocarReferencia(
       notaActual.referencia ?? notaActual.midi,
       notaActual.segundosRef ?? 1.2,
+      timbreRef.current,
     );
     await pausaCancellable(300, canceladoRef);
     if (canceladoRef.current) return;
@@ -361,7 +578,11 @@ export default function PantallaEjercicio({
   return (
     <div className="mx-auto w-full max-w-xl px-4 py-6">
       <div className="mb-4 flex items-center justify-between gap-3">
-        <button onClick={salir} className="inline-flex min-h-9 items-center px-2 text-sm text-slate-400 hover:text-white">
+        <button
+          type="button"
+          onClick={salir}
+          className="inline-flex min-h-9 items-center px-2 text-sm text-slate-400 hover:text-white"
+        >
           {'< Volver'}
         </button>
         <AyudaLeccion leccionId={leccionParaEjercicio(ejercicio.id)} />
@@ -412,14 +633,52 @@ export default function PantallaEjercicio({
           <div className="rounded-xl bg-slate-900 p-4 text-sm text-slate-300">
             <p className="font-semibold text-white">Cómo se hace</p>
             <ol className="mt-2 list-decimal space-y-1 pl-5">
-              <li>La app toca una nota.</li>
+              <li>La app toca una referencia.</li>
               <li>
                 {modoLibre
                   ? 'Cantá y tocá "Siguiente nota" cuando estés listo.'
                   : 'Cuando dice "Cantá ahora", cantá durante el tiempo indicado.'}
               </li>
               <li>No hace falta saber el nombre de la nota: copiá el sonido.</li>
+              <li>
+                Podés usar el botón manual para grabarte, escucharte y guardar
+                tus notas.
+              </li>
             </ol>
+          </div>
+
+          <div className="mt-4 rounded-xl bg-slate-900 p-4">
+            <p className="text-sm font-semibold text-white">
+              Cómo suena la referencia
+            </p>
+            <p className="mt-1 text-xs text-slate-400">
+              Elegí una voz humana cantando "ah" o una nota pura. Con auriculares
+              escuchás mejor la diferencia.
+            </p>
+            <div className="mt-2 flex gap-2">
+              <button
+                type="button"
+                onClick={() => cambiarTimbre('voz')}
+                className={`min-h-10 flex-1 rounded-lg px-3 py-2 text-sm font-semibold transition ${
+                  timbre === 'voz'
+                    ? 'bg-violet-600 text-white'
+                    : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+                }`}
+              >
+                Voz (ah)
+              </button>
+              <button
+                type="button"
+                onClick={() => cambiarTimbre('nota')}
+                className={`min-h-10 flex-1 rounded-lg px-3 py-2 text-sm font-semibold transition ${
+                  timbre === 'nota'
+                    ? 'bg-violet-600 text-white'
+                    : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+                }`}
+              >
+                Nota pura
+              </button>
+            </div>
           </div>
 
           <label className="mt-4 flex cursor-pointer items-center justify-between rounded-xl bg-slate-900 p-4">
@@ -452,7 +711,22 @@ export default function PantallaEjercicio({
               </li>
             ))}
           </ul>
+
+          <div className="mt-4 rounded-xl bg-slate-900 p-4">
+            <p className="text-sm font-semibold text-white">
+              Mis tomas guardadas
+            </p>
+            <p className="mt-1 text-xs text-slate-400">
+              Escuchá o borrá tus grabaciones previas en este ejercicio.
+            </p>
+            <MisReferencias
+              ejercicioId={ejercicio.id}
+              refrescar={refrescarReferencias}
+            />
+          </div>
+
           <button
+            type="button"
             onClick={() => void empezar()}
             disabled={ocupado}
             className="mt-6 w-full rounded-xl bg-violet-600 py-3 font-semibold text-white hover:bg-violet-500 disabled:opacity-50"
@@ -480,6 +754,31 @@ export default function PantallaEjercicio({
           <div className="mt-3 text-center">
             <div className="text-xs text-slate-500">Imitá esta nota con un "aaa"</div>
             <div className="text-3xl font-black text-white">{nombreNota(notaActual.midi)}</div>
+            <div className="mt-2 flex items-center justify-center gap-2 text-xs">
+              <span className="text-slate-400">Referencia:</span>
+              <button
+                type="button"
+                onClick={() => cambiarTimbre('voz')}
+                className={`rounded-lg px-2.5 py-1 font-semibold transition ${
+                  timbre === 'voz'
+                    ? 'bg-violet-600 text-white'
+                    : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+                }`}
+              >
+                Voz (ah)
+              </button>
+              <button
+                type="button"
+                onClick={() => cambiarTimbre('nota')}
+                className={`rounded-lg px-2.5 py-1 font-semibold transition ${
+                  timbre === 'nota'
+                    ? 'bg-violet-600 text-white'
+                    : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+                }`}
+              >
+                Nota pura
+              </button>
+            </div>
           </div>
 
           <div
@@ -551,11 +850,109 @@ export default function PantallaEjercicio({
             Línea blanca: la nota. Verde: afinado. Amarillo: cerca. Rojo: fuera.
           </p>
 
+          {/* Panel de grabación manual */}
+          {puedeGrabar && (
+            <div className="mt-4 rounded-xl border border-slate-800 bg-slate-900 p-4">
+              <div className="flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="text-sm font-semibold text-white">
+                    Grabarte para escucharte
+                  </p>
+                  <p className="mt-0.5 text-xs text-slate-400">
+                    {grabandoManual
+                      ? '● Grabando tu voz... cantá la nota.'
+                      : tomaActual
+                        ? 'Escuchate abajo y elegí si guardarla o borrarla.'
+                        : 'Tocá el botón para grabar tu voz en esta nota.'}
+                  </p>
+                </div>
+                {grabandoManual ? (
+                  <button
+                    type="button"
+                    onClick={detenerGrabacionManual}
+                    className="inline-flex min-h-10 shrink-0 items-center gap-2 rounded-xl bg-red-600 px-4 py-2 text-sm font-semibold text-white animate-pulse hover:bg-red-500"
+                  >
+                    <span className="h-2.5 w-2.5 rounded-full bg-white"></span>
+                    Detener
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={iniciarGrabacionManual}
+                    disabled={subFase !== 'canta'}
+                    className="inline-flex min-h-10 shrink-0 items-center gap-2 rounded-xl bg-violet-600 px-3 py-2 text-sm font-semibold text-white hover:bg-violet-500 disabled:opacity-50"
+                  >
+                    <span>🎙️</span>
+                    {tomaActual ? 'Grabar de nuevo' : 'Grabar mi voz'}
+                  </button>
+                )}
+              </div>
+
+              {tomaActual && !grabandoManual && (
+                <div className="mt-3 rounded-lg bg-slate-950 p-3">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-slate-300">
+                      Tu grabación de {nombreNota(notaActual.midi)}:
+                    </span>
+                    {tomaActual.guardada ? (
+                      <span className="font-semibold text-emerald-400">
+                        ✓ Guardada en tus tomas
+                      </span>
+                    ) : (
+                      <span className="text-slate-500">Sin guardar</span>
+                    )}
+                  </div>
+                  <audio
+                    controls
+                    src={tomaActual.url}
+                    className="mt-2 w-full"
+                    preload="metadata"
+                  >
+                    Tu navegador no permite reproducir esta toma.
+                  </audio>
+                  <div className="mt-2 flex gap-2">
+                    {!tomaActual.guardada ? (
+                      <button
+                        type="button"
+                        onClick={() => void guardarTomaActual()}
+                        disabled={guardandoToma}
+                        className="flex-1 rounded-lg bg-emerald-600 py-2 text-xs font-semibold text-white hover:bg-emerald-500 disabled:opacity-50"
+                      >
+                        {guardandoToma ? 'Guardando...' : '💾 Guardar toma'}
+                      </button>
+                    ) : (
+                      <span className="flex-1 rounded-lg bg-emerald-950 py-2 text-center text-xs text-emerald-200">
+                        Guardada en este navegador
+                      </span>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => void descartarTomaActual()}
+                      className="rounded-lg bg-slate-800 px-3 py-2 text-xs text-slate-300 hover:bg-slate-700"
+                    >
+                      🗑️ Borrar toma
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {avisoToma && (
+                <p
+                  role="alert"
+                  className="mt-2 rounded-lg bg-yellow-950 p-2 text-xs text-yellow-200"
+                >
+                  {avisoToma}
+                </p>
+              )}
+            </div>
+          )}
+
           {subFase === 'canta' && (
-            <div className="mt-3 space-y-2">
+            <div className="mt-4 space-y-2">
               {modoLibre ? (
                 <>
                   <button
+                    type="button"
                     onClick={pasarSiguiente}
                     disabled={!alcanzaCantoMinimo(enVivo.tiempoVozMs)}
                     className="w-full rounded-xl bg-violet-600 py-3 font-semibold text-white hover:bg-violet-500 disabled:opacity-50"
@@ -565,6 +962,7 @@ export default function PantallaEjercicio({
                       : 'Siguiente nota'}
                   </button>
                   <button
+                    type="button"
                     onClick={repetirNota}
                     className="w-full rounded-xl bg-slate-800 py-2 text-sm text-white hover:bg-slate-700"
                   >
@@ -576,6 +974,7 @@ export default function PantallaEjercicio({
                 </>
               ) : (
                 <button
+                  type="button"
                   onClick={escucharNota}
                   className="w-full rounded-xl bg-slate-800 py-2 text-sm text-white hover:bg-slate-700"
                 >
@@ -606,6 +1005,41 @@ export default function PantallaEjercicio({
                   : 'Todavía no. Ajustá el micrófono y probá otra vez.'}
             </p>
           </div>
+
+          {tomasGuardadas > 0 && (
+            <div className="mt-4 rounded-xl bg-emerald-950 p-4 text-sm text-emerald-100">
+              <p className="font-semibold">
+                Guardaste {tomasGuardadas} toma
+                {tomasGuardadas === 1 ? '' : 's'} en esta sesión.
+              </p>
+              <p className="mt-1 text-xs text-emerald-200">
+                Quedan guardadas en este navegador para que las escuches como
+                referencia.
+              </p>
+            </div>
+          )}
+
+          <div className="mt-4 rounded-xl bg-slate-900 p-4">
+            <p className="text-sm font-semibold text-white">
+              Mis tomas guardadas
+            </p>
+            <p className="mt-1 text-xs text-slate-400">
+              Escuchá o borrá tus tomas grabadas en este ejercicio.
+            </p>
+            <MisReferencias
+              ejercicioId={ejercicio.id}
+              refrescar={refrescarReferencias}
+            />
+          </div>
+
+          {avisoToma && (
+            <p
+              role="alert"
+              className="mt-4 rounded-lg bg-yellow-950 p-3 text-sm text-yellow-200"
+            >
+              {avisoToma}
+            </p>
+          )}
 
           {sinVoz && (
             <div className="mt-4 rounded-xl bg-yellow-950 p-4 text-sm text-yellow-200">
@@ -656,12 +1090,17 @@ export default function PantallaEjercicio({
 
           <div className="mt-6 flex gap-3">
             <button
+              type="button"
               onClick={() => { setFase('intro'); }}
               className="flex-1 rounded-xl bg-violet-600 py-3 font-semibold text-white hover:bg-violet-500"
             >
               Reintentar
             </button>
-            <button onClick={salir} className="flex-1 rounded-xl bg-slate-700 py-3 text-white hover:bg-slate-600">
+            <button
+              type="button"
+              onClick={salir}
+              className="flex-1 rounded-xl bg-slate-700 py-3 text-white hover:bg-slate-600"
+            >
               Inicio
             </button>
           </div>

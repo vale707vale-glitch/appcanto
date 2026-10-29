@@ -112,6 +112,111 @@ export function tocarAcorde(
   };
 }
 
+export type TimbreReferencia = 'voz' | 'nota';
+
+/**
+ * Referencia con timbre de voz humana cantando "ah".
+ * Sintesis por formantes: una fuente con armonicos pasa por tres filtros
+ * (F1/F2/F3) y un vibrato suave. No usa archivos de audio.
+ */
+export function tocarVoz(
+  midi: number,
+  duracionSec: number,
+  audioCtx: AudioContext = ensureAudioContext(),
+  volumen = 0.18,
+): Promise<void> {
+  return new Promise((resolve) => {
+    const t0 = audioCtx.currentTime;
+    const dur = Math.max(0.4, duracionSec);
+    const ataque = Math.min(0.09, dur * 0.25);
+    const liberacion = Math.min(0.18, dur * 0.3);
+    const f0 = midiToFreq(midi);
+
+    const fuente = audioCtx.createOscillator();
+    fuente.type = 'sawtooth';
+    fuente.frequency.setValueAtTime(f0, t0);
+
+    const vibrato = audioCtx.createOscillator();
+    const vibratoGanancia = audioCtx.createGain();
+    vibrato.type = 'sine';
+    vibrato.frequency.setValueAtTime(5.2, t0);
+    vibratoGanancia.gain.setValueAtTime(6, t0);
+    vibrato.connect(vibratoGanancia);
+    vibratoGanancia.connect(fuente.detune);
+
+    const salida = audioCtx.createGain();
+    salida.gain.setValueAtTime(0.0001, t0);
+    salida.gain.exponentialRampToValueAtTime(volumen, t0 + ataque);
+    salida.gain.setValueAtTime(
+      volumen,
+      t0 + Math.max(ataque, dur - liberacion),
+    );
+    salida.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    salida.connect(audioCtx.destination);
+
+    const cuerpoFiltro = audioCtx.createBiquadFilter();
+    cuerpoFiltro.type = 'lowpass';
+    cuerpoFiltro.frequency.setValueAtTime(3200, t0);
+    cuerpoFiltro.Q.setValueAtTime(0.6, t0);
+    const cuerpo = audioCtx.createGain();
+    cuerpo.gain.setValueAtTime(0.22, t0);
+    fuente.connect(cuerpoFiltro);
+    cuerpoFiltro.connect(cuerpo);
+    cuerpo.connect(salida);
+
+    const formantes = [
+      { frecuencia: 700, q: 8, ganancia: 0.9 },
+      { frecuencia: 1180, q: 11, ganancia: 0.55 },
+      { frecuencia: 2600, q: 9, ganancia: 0.28 },
+    ];
+    const nodos: AudioNode[] = [cuerpoFiltro, cuerpo, salida, vibratoGanancia];
+    for (const formante of formantes) {
+      const filtro = audioCtx.createBiquadFilter();
+      filtro.type = 'bandpass';
+      filtro.frequency.setValueAtTime(formante.frecuencia, t0);
+      filtro.Q.setValueAtTime(formante.q, t0);
+      const ganancia = audioCtx.createGain();
+      ganancia.gain.setValueAtTime(formante.ganancia, t0);
+      fuente.connect(filtro);
+      filtro.connect(ganancia);
+      ganancia.connect(salida);
+      nodos.push(filtro, ganancia);
+    }
+
+    fuente.start(t0);
+    vibrato.start(t0);
+    fuente.stop(t0 + dur + 0.05);
+    vibrato.stop(t0 + dur + 0.05);
+    fuente.onended = () => {
+      for (const nodo of nodos) {
+        try {
+          nodo.disconnect();
+        } catch {
+          // ya estaba desconectado
+        }
+      }
+      try {
+        fuente.disconnect();
+        vibrato.disconnect();
+      } catch {
+        // ignorar
+      }
+      resolve();
+    };
+  });
+}
+
+export function tocarReferencia(
+  midi: number,
+  duracionSec: number,
+  timbre: TimbreReferencia = 'voz',
+  audioCtx: AudioContext = ensureAudioContext(),
+): Promise<void> {
+  return timbre === 'voz'
+    ? tocarVoz(midi, duracionSec, audioCtx)
+    : tocarNota(midi, duracionSec, audioCtx);
+}
+
 export function tocarNota(
   midi: number,
   duracionSec: number,

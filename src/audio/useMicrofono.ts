@@ -119,5 +119,13 @@ export function useMicrofono() {
 
   useEffect(() => detener, [detener]);
 
-  return { estado, mensajeError, motorRef, fijarObjetivo, iniciar, detener };
+  return {
+    estado,
+    mensajeError,
+    motorRef,
+    flujoRef: streamRef,
+    fijarObjetivo,
+    iniciar,
+    detener,
+  };
 }
